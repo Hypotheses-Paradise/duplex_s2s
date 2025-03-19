@@ -1,93 +1,94 @@
 # s2s-dev
 
+This repo contains the training recipes that use the new (as of Mar 19th 2025) scalable S2S codebase. **The code is still in development and likely to change.**
 
+The recipes and scripts here are confirmed to work on `draco-oci-iad`.
 
-## Getting started
+## Structure
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+### Running experiments
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+Use the scripts below to run experiments. **Remember to override the paths and W&B keys with your own in .sub and .yaml files!**
 
-## Add your files
+* `auto_launcher_with_seed.sh` - use it to submit SLURM jobs on the cluster, e.g. `./auto_launcher_with_seed.sh -n8 s2s_tinyllama_repro.sub` submits 8 consecutive jobs. This script generates a random seed for each submitted SLURM job, leveraging `shard_seed="randomized"` option in lhotse to ensure each data parallel rank is seeded differently, but each tensor parallel rank is seeded identically.
+* `s2s_tinyllama_repro.sub` - SLURM submission script for a single job, contains a minimal amount of boilerplate code. This particular script attempts to reproduce Zhehuai's TinyLlama-1B S2S recipe.
+* `s2s_tinyllama_repro.yaml` - The experiment configuration. Prefer copying and modifying this file rather than overriding options in the SLURM script to have the entire configuration available at a glance and readily versioned.
+* `train_icfg_12mar2025.yaml` - YAML configuration specifying all training data sources and their weights. This config is a 99% subset of Zhehuai's TinyLlama-1B S2S recipe training data.
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
+### Debugging
 
-```
-cd existing_repo
-git remote add origin https://gitlab-master.nvidia.com/pzelasko/s2s-dev.git
-git branch -M main
-git push -uf origin main
-```
+* `get_interactive_node.sh` - use it to fetch a node for interactive jobs and debugging.
+* `run.sh` - uses `torchrun` to launch a job with a specified configuration, useful for debugging, quick checks, and profiling (nsys command available inside).
 
-## Integrate with your tools
+## S2S codebase
 
-- [ ] [Set up project integrations](https://gitlab-master.nvidia.com/pzelasko/s2s-dev/-/settings/integrations)
+The new S2S codebase is available in the following branch: https://github.com/NVIDIA/NeMo/tree/duplex-s2s-new (PR: https://github.com/NVIDIA/NeMo/pull/12617).
+Below is an outline of how it's structured and what's the rationale.
 
-## Collaborate with your team
+They key idea of this codebase is that it should be fairly small and allow to swap out different LLMs easily, as well as scale up their size for training.
+It is also expected to be efficient, hence some profiling scripts and code are included. The swapping out of LLMs is confirmed to work (succesfully done with TinyLlama, Llama3, Gemma1, Qwen2.5).
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+### Training script and config
 
-## Test and Deploy
+**examples/duplex_s2s/s2s_duplex_train.py** 
+This is the main training script. It's very brief and similar to ASR collection training scripts. The main difference is that it instantiates a Lightning DataModule separately from the model. It currently uses `exp_manager` for checkpointing, resumption, and W&B logger setup, but that might change in the future.
 
-Use the built-in continuous integration in GitLab.
+**examples/duplex_s2s/conf/s2s_duplex.yaml**
+This is an example configuration I use to develop this code on my workstation. You might need to replace some paths to make that work on yours.
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+### Collection: duplex_s2s 
 
-***
+**nemo/collections/duplex_s2s** 
+This is the root directory for this small development collection. I will refer to paths within this root below.
 
-# Editing this README
+**data/datamodule.py**
+Contains definition of a Lightning DataModule adequate for S2S (but probably can be re-used more broadly if made to accept a `Dataset` class).
+It takes care of setting up the proper DP ranks for dataloaders, and instantiating them.
+Keep in mind the actual dataset paths and blend are defined by the YAML config, not Python code.
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+**data/dataset.py**
+Defines S2S dataset class that converts Lhotse Cuts to a dict of tensors. It mostly follows the logic from the original S2S codebase but is simplified and shorter. 
+It returns collated mini-batches of source/target audio (wav) and source/target tokens (tokenized text). 
+The data format is the following: 
+* each cut contains `.recording` and `.target_audio` attributes used for loading source and target audio correspondingly
+* each cut contains a list of `supervisions` with objects of type `lhotse.SupervisionSegment` that represent turns with corresponding text and speaker information.
+* the text of each supervision is tokenized and identified as model's output (`supervision.speaker == 'agent'`) or model's input.
+* `target_tokens` and `source_tokens` are created to have length equal to `lhotse.utils.compute_num_frames(cut.duration, frame_length, cut.sampling_rate)` - the `frame_length` is typically 80ms in our setups.
+* we use `lhotse.utils.compute_num_frames(supervision.start, frame_length)` to determine the token offset for assigning the turn-specific tokens
+* if the token sequence is too long vs the audio, we might emit warnings in some cases we are able to detect, but generally these tokens will be truncated and are likely an invalid training example. This should be fixed sometime.
 
-## Suggestions for a good README
+**modules/perception.py**
+Verbatim copy from `multimodal/speech_llm` collection. This is a wrapper on ASR encoder that adds a few layers of "modality adapter" and performs SpecAugment (if configured). 
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+**models/duplex_s2s_model.py**
+This is the heart of this new codebase - the model definition itself. Key insights:
+* The constructor `__init__` initializes pretrained ASR encoder/perception; LLM (using HuggingFace AutoModel); and audio codec. It also adds separate text token and audio token prediction heads.
+* `forward` accepts input representations (i.e. the sum of audio perception and text embedding outputs) and runs an offline forward pass through the LM and boths token prediction heads, returns logits for each.
+* `training_step` builds the input representations with `prepare_inputs`, runs `forward`, computes the losses, and logs some information.
+* `prepare_inputs` runs source audio through `perception` (with grads on; learnable); target audio through audio codec (grads off; non-trainable); truncates source/target audio and target text sequences if needed (mismatch in token sequence length up to 2 is ignored, otherwise we emit warnings); does extra truncation if tensor parallelism is enabled to avoid shape mismatches with sequence parallelism; and returns a dict with input and label tensors suitable for `forward`/`training_step`.
+* Validation first clears GPU memory (to avoid OOM), loads a scoring ASR model into GPU, and initializes metric aggregation. After validation is finished, the scoring ASR model is deleted, final metrics are logged, and cleared too, together with GPU memory.
+* Validation is configured to use multiple dataloaders in parallel (see [Lightning's CombinedLoader with max_size mode](https://lightning.ai/docs/pytorch/stable/api/lightning.pytorch.utilities.combined_loader.html#lightning.pytorch.utilities.combined_loader.CombinedLoader). That means the batch in `validation_step` is not a single batch: it is a dict where the key is the dataset name, and the value is its mini-batch. This is why we loop over `batch.items()`. Even for a single validation dataset, we should provide its name. This is configured via `data.validation_ds.datasets` field in the YAML config. This solution enables us to track the metrics across each dataset elegantly, as well as specifying individual override options in the config (each validation/test dataloader inherits options from `validation_ds` namespace, minus `datasets` key, and then overrides them with the options in `validation_ds.datasets.<current-dataset-name>` namespace).
+* Currently supported metrics are validation loss (per dataset + aggregated) and ASR BLEU.
+* Preliminary support for OOMptimizer is added, but not tested thoroughly yet, so I've been using only `batch_duration` so far.
 
-## Name
-Choose a self-explaining name for your project.
+The final method I'm about to describe is the most important for scaling model sizes: `configure_model`.
+In the YAML configuration we can select a `ModelParallelStrategy` under `trainer.strategy`, which makes Lightning configure an object called `trainer.device_mesh`.
+The mesh has a "shape" where each dimension is either data-parallel or model-parallel dimension, allowing us to combine FSDP2 with TP/SP.
+We control the shape by specifying the world size of `data_parallel` and `tensor_parallel` in the YAML config, under `trainer.strategy`.
+A shape of 1 means a given dimension is disabled (allowing us to do pure FSDP2; pure TP; or a mix for 2D parallelism).
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+Inside `configure_model`, our task is to tell PyTorch how do we want to distribute different layers of the model across GPUs.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+With FSDP2, we generally call `fully_shard` on modules which tells PyTorch to distribute (shard) all parameters in that module across `data_parallel` world size,
+all-gather them just before the computation starts, and de-allocate after we leave that layer. The more granularly we call this on the model's modules, the more memory we save, but the larger is the communication overhead. Current state seems to be an OK balance that lets us train ~30B models with just FSDP2.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+With TP/SP, we similarly call `parallelize_module` on certain modules together with a "parallelization plan". This is a bit more involved and requires you to understand how TP/SP works. I won't go into details here, but I'll link a doc with useful resources below. The current implementation seems to be working but hasn't been tested thoroughly yet - unlike FSDP2.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+Note that since different HF LLMs have minor variations in architecture, we might need to keep a registry of `configure_model` functions that parallelize/shard the models appropriately, and use the appropriate function for a given model.
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+I've collected useful resources about this topic here: https://docs.google.com/document/d/1sHWZrXs1hjpsXlJbmQx7HR9pbps8uadY9Bn38CitICE
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+### Profiling
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+To profile, uncomment the nsys command in `run.sh`, and uncomment the line adding `PROFILING()` callback in the `Trainer` in the training script. 
+The resulting profile can be opened in NVIDIA Nsight systems GUI for analysis.

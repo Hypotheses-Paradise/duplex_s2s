@@ -1,0 +1,165 @@
+model:
+  pretrained_llm: TinyLlama/TinyLlama_v1.1
+#  pretrained_llm: google/gemma-2-2b-it
+#  pretrained_llm: google/gemma-2-9b-it
+#  pretrained_llm: meta-llama/Llama-3.2-3B-Instruct
+#  pretrained_llm: meta-llama/Llama-3.1-8B-Instruct
+#  pretrained_llm: Qwen/Qwen2.5-7B-Instruct
+#  pretrained_llm: Qwen/Qwen2.5-32B-Instruct
+#  pretrained_llm: Qwen/Qwen2.5-72B-Instruct
+#  pretrained_audio_codec: nvidia/low-frame-rate-speech-codec-22khz
+  pretrained_audio_codec: /lustre/fsw/portfolios/llmservice/users/pzelasko/duplex_s2s/Low_Frame-rate_Speech_Codec++_without_speaker_encoder.nemo
+  pretrained_asr: /lustre/fsw/portfolios/llmservice/users/pzelasko/duplex_s2s/stt_en_fastconformer_hybrid_large_streaming_80ms.nemo
+  scoring_asr: stt_en_fastconformer_transducer_large
+
+  perception:
+     target: nemo.collections.multimodal.speech_llm.modules.perception_modules.AudioPerceptionModule
+
+     preprocessor:
+       normalize: 'NA'
+
+     encoder:
+       self_attention_model:
+       att_context_size: [70, 1]
+       conv_context_size: causal
+       conv_norm_type: layer_norm
+
+     modality_adapter:
+       _target_: nemo.collections.asr.modules.ConformerEncoder
+       feat_in: 512
+       feat_out: -1 # you may set it if you need different output size other than the default d_model
+       n_layers: 2
+       d_model: 512
+       subsampling: dw_striding # vggnet, striding, stacking or stacking_norm, dw_striding
+       subsampling_factor: 1 # must be power of 2 for striding and vggnet
+       subsampling_conv_channels: 256 # set to -1 to make it equal to the d_model
+       causal_downsampling: true
+       ff_expansion_factor: 4
+       self_attention_model: rel_pos_local_attn # rel_pos or abs_pos
+       n_heads: 8 # may need to be lower for smaller d_models
+       # [left, right] specifies the number of steps to be seen from left and right of each step in self-attention
+       att_context_size: [70, 1] # -1 means unlimited context
+       att_context_style: chunked_limited # regular or chunked_limited
+       xscaling: true # scales up the input embeddings by sqrt(d_model)
+       untie_biases: true # unties the biases of the TransformerXL layers
+       pos_emb_max_len: 5000
+       conv_kernel_size: 9
+       conv_norm_type: layer_norm # batch_norm or layer_norm or groupnormN (N specifies the number of groups)
+       # conv_context_size can be"causal" or a list of two integers while conv_context_size[0]+conv_context_size[1]+1==conv_kernel_size
+       # null means [(kernel_size-1)//2, (kernel_size-1)//2], and 'causal' means [(kernel_size-1), 0]
+       conv_context_size: causal
+       ### regularization
+       dropout: 0 # The dropout used in most of the Conformer Modules
+       dropout_pre_encoder: 0 # The dropout used before the encoder
+       dropout_emb: 0.0 # The dropout used for embeddings
+       dropout_att: 0 # The dropout for multi-headed attention modules
+#       dropout: 0.1 # The dropout used in most of the Conformer Modules
+#       dropout_pre_encoder: 0.1 # The dropout used before the encoder
+#       dropout_emb: 0.0 # The dropout used for embeddings
+#       dropout_att: 0.1 # The dropout for multi-headed attention modules
+
+     spec_augment:
+       _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+       freq_masks: 2 # set to zero to disable it
+       time_masks: 10 # set to zero to disable it
+       freq_width: 27
+       time_width: 0.05
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 3e-4
+    betas: [0.9, 0.98]
+    weight_decay: 0
+    foreach: true # set to false if having issues with tensor-parallelism
+
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.InverseSquareRootAnnealing
+    warmup_steps: 2500
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: False # logger provided by exp_manager
+  enable_checkpointing: False
+  use_distributed_sampler: False
+  max_steps: 100000
+  limit_train_batches: ${trainer.max_steps}
+  log_every_n_steps: 10
+  val_check_interval: 1000
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+      #_target_: lightning.pytorch.strategies.ModelParallelStrategy
+      #tensor_parallel_size: 1
+      #data_parallel_size: 8
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+
+data:
+  frame_length: 0.08
+  source_sample_rate: 16000
+
+  train_ds:
+    sample_rate: 22050
+    input_cfg: /lustre/fsw/portfolios/llmservice/users/pzelasko/duplex_s2s/train_icfg_12mar2025.yaml
+    seed: 42
+    shard_seed: "randomized"
+    num_workers: 4
+
+    batch_duration: 1200
+    max_duration: 142.39029
+    bucket_duration_bins: [18.53054,23.99143,27.86399,31.01224,33.74109,36.38431,38.95202,41.61,44.43694,47.34354,50.31546,52.73034,55.47535,58.71342,61.93086,65.362,68.73932,72.2351,75.81098,79.38685,83.2878,88.34975,94.27002,100.19193,107.30404,115.88381,125.60508,133.02385,142.39029]
+    use_bucketing: true
+    bucket_buffer_size: 10000
+
+  validation_ds:
+    datasets:
+      nvolve_chatqa_test:
+        shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/nvolve_chatqa_test/
+      nvolve_multiturn_test:
+        shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/brainy_mantis/emma_trimmed_overlap_0.64/nvolve_multiturn_test/
+      synthetic_roleplay_v2_test:
+        shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/brainy_mantis/emma_trimmed_overlap_0.64/synthetic_roleplay_v2_test/
+      340b_8.19_daring_anteater_lmsys_sft_8801rm3.7p_test:
+        shar_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data/duplex/340b_8.19_daring_anteater_lmsys_sft_8801rm3.7p_test/
+      ultrachat:
+        shar_path: /lustre/fsw/portfolios/llmservice/users/kevinhu/duplex/ultrachat/shar_duplex/manifest_000019
+      topic_v2_llama3:
+        shar_path: /lustre/fsw/portfolios/llmservice/users/kevinhu/duplex/topic_v2/Meta-Llama-3.1-70B-Instruct/shar_duplex/manifest_000050
+    sample_rate: 22050
+    batch_size: 8
+    seed: 42
+    shard_seed: "randomized"
+
+exp_manager:
+   exp_dir: null
+   explicit_log_dir: /lustre/fsw/portfolios/llmservice/users/pzelasko/duplex_s2s/results
+   name: duplex_s2s
+   create_tensorboard_logger: false
+   create_checkpoint_callback: true
+   use_datetime_version: true
+   max_time_per_run: 00:03:50:00
+
+   resume_from_checkpoint: null # The path to a checkpoint file to continue the training, restores the whole state including the epoch, step, LR schedulers, apex, etc.
+   # you need to set these two to True to continue the training
+   resume_if_exists: true
+   resume_ignore_no_checkpoint: true
+
+   # You may use this section to create a W&B logger
+   create_wandb_logger: true
+   wandb_logger_kwargs:
+     name: development-run
+     project: duplex_s2s
+     resume: true
+
+   checkpoint_callback_params:
+     filename: "{val_loss:.3f}_{step}"
+     every_n_train_steps: ${trainer.val_check_interval}
+     every_n_epochs: null
+     save_top_k: 1
+     always_save_nemo: false

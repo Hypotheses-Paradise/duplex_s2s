@@ -1,0 +1,6 @@
+exp/
+results/
+.ipynb_checkpoints/
+NeMo/
+lhotse/
+*.nsys-rep

@@ -1,0 +1,78 @@
+#!/bin/bash
+#SBATCH -A convai_convaird_nemo-speech
+#SBATCH -J "convai_convaird_nemo-speech-speechllm:canary_v0_speechllm"            # job name (<< CHANGE ! >>)
+#SBATCH -p batch_block1,batch_block3,batch_block4
+#SBATCH -N 4  # number of nodes
+#SBATCH -t 4:00:00              # wall time
+#SBATCH --time-min 04:00:00  
+#SBATCH --ntasks-per-node=8    # n tasks per machine (one task per gpu) <required>
+#SBATCH --gpus-per-node=8
+#SBATCH --exclusive
+#SBATCH --overcommit
+#SBATCH --mem=0
+
+set -x
+
+# Choose the right project and replace in the header:
+#
+# #SBATCH -A convai_convaird_nemo-speech
+# #SBATCH -J "convai_convaird_nemo-speech-speechllm:canary_v0_speechllm"            # job name (<< CHANGE ! >>)
+#
+# #SBATCH -A llmservice_nemo_speechlm
+# #SBATCH -J "llmservice_nemo_speechlm-speechllm:canaryXL"            # job name (<< CHANGE ! >>)
+
+if [ -z "$1" ]; then
+    echo "First argument (random seed) is missing"
+    exit 1
+fi
+SEED="${1}"
+
+GPUS_PER_NODE=$SLURM_GPUS_PER_NODE
+TOTAL_NUM_GPUS=`expr $GPUS_PER_NODE \* $SLURM_JOB_NUM_NODES`
+
+SLURM_ACCOUNT=portfolios/llmservice		# <Make sure you dont override SLURM_ACCOUNT!>
+LUSTRE_ACCOUNT_PREFIX=/lustre/fsw/${SLURM_ACCOUNT}  
+WANDB="7722e8426e7e5d0aef1a9a6f4d1dbf099f077883" # replace with your own WandB API key
+
+CONTAINER=/lustre/fsw/portfolios/llmservice/users/pzelasko/containers/nemo-25.02.rc7-pytorch2.6-11mar25.sqsh
+CODE_DIR=/lustre/fsw/portfolios/llmservice/users/pzelasko/duplex_s2s/NeMo
+LHOTSE_DIR=/lustre/fsw/portfolios/llmservice/users/pzelasko/duplex_s2s/lhotse
+DATA_DIR=/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data
+
+#MOUNTS="--container-mounts=${CODE_DIR},${DATA_DIR}:/data,/lustre/fsw,${LUSTRE_ACCOUNT_PREFIX},/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data,${LUSTRE_ACCOUNT_PREFIX}/users/pzelasko"
+MOUNTS='--container-mounts=/lustre/fsw/portfolios/llmservice/users/pzelasko/duplex_s2s/NeMo,/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data:/data,/lustre/fsw,/lustre/fsw/portfolios/llmservice,/lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_speechlm/data,/lustre/fsw/portfolios/llmservice/users/pzelasko,/lustre/fsw/portfolios/llmservice/users/kevinhu/duplex,/lustre/fsw/portfolios/llmservice/users/kevinhu/s2s'
+
+CONFIG_PATH="$(pwd)"  # Adjust if launching from outside this directory.
+CONFIG_NAME="s2s_tinyllama_repro"
+EXP_NAME="${CONFIG_NAME}_${SLURM_JOB_NUM_NODES}node"
+RESULTS_DIR="/lustre/fsw/portfolios/llmservice/users/pzelasko/duplex_s2s/exp/${EXP_NAME}"
+mkdir -p ${RESULTS_DIR}
+
+read -r -d '' cmd <<EOF
+export WANDB_API_KEY="${WANDB}" \
+&& export AIS_ENDPOINT="http://asr.iad.oci.aistore.nvidia.com:51080" \
+&& export PYTHONPATH="${CODE_DIR}:${LHOTSE_DIR}:${PYTHONPATH}" \
+&& export HF_HOME="/lustre/fsw/portfolios/llmservice/users/pzelasko/hf_cache" \
+&& export OMP_NUM_THREADS=1 \
+&& export TOKENIZERS_PARALLELISM=false \
+&& export LHOTSE_AUDIO_DURATION_MISMATCH_TOLERANCE=0.3 \
+&& HYDRA_FULL_ERROR=1 TORCH_CUDNN_V8_API_ENABLED=1 \
+python /lustre/fsw/portfolios/llmservice/users/pzelasko/duplex_s2s/NeMo/examples/duplex_s2s/s2s_duplex_train.py \
+    --config-path=$CONFIG_PATH \
+    --config-name=$CONFIG_NAME \
+    exp_manager.name=${EXP_NAME} \
+    exp_manager.wandb_logger_kwargs.name=${EXP_NAME} \
+    trainer.num_nodes=$SLURM_JOB_NUM_NODES \
+    exp_manager.explicit_log_dir=${RESULTS_DIR} \
+    data.train_ds.seed=$SEED \
+    data.validation_ds.seed=$SEED 
+EOF
+
+
+#trainer.strategy.data_parallel_size=${TOTAL_NUM_GPUS} \
+
+OUTFILE=${RESULTS_DIR}/slurm-%j-%n.out
+ERRFILE=${RESULTS_DIR}/error-%j-%n.out
+
+srun -o $OUTFILE -e $ERRFILE --container-image="$CONTAINER" $MOUNTS bash -c "${cmd}"
+#bash -c "${cmd}"

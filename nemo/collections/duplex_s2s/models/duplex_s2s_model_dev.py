@@ -35,7 +35,7 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torchmetrics.text import SacreBLEUScore
-from transformers import AutoModel, AutoModelForCausalLM
+from transformers import AutoModel
 
 from nemo.collections.asr.models import ASRModel
 from nemo.collections.common.parts.optional_cuda_graphs import WithOptionalCudaGraphs
@@ -117,7 +117,7 @@ class DuplexS2SModel(LightningModule):
 
     def forward(
         self,
-        input,
+        input_embeds: Tensor,
     ) -> dict[str, Tensor]:
         """
         Implements a fully offline forward pass through the entire model.
@@ -128,7 +128,7 @@ class DuplexS2SModel(LightningModule):
                                                      |-> |lm_head|    -> |token ids  |
         """
         # input_embeds and out: (B, T, H)
-        out = self.llm(inputs_embeds=input["input_embeds"])
+        out = self.llm(inputs_embeds=input_embeds)
         B, T = input_embeds.shape[:2]
         text_logits = self.lm_head(out['last_hidden_state'])  # (B, T, num_text_tokens)
         audio_logits = self.audio_head(out['last_hidden_state']).view(
@@ -251,8 +251,7 @@ class DuplexS2SModel(LightningModule):
 
     def training_step(self, batch: dict, batch_idx: int):
         inputs = self.prepare_inputs(batch)
-
-        forward_outputs = self(inputs)
+        forward_outputs = self(inputs["input_embeds"])
         num_frames = inputs["input_lens"].sum()
         with loss_parallel():
             text_loss = (
@@ -319,7 +318,7 @@ class DuplexS2SModel(LightningModule):
             if dataset_batch is None:
                 continue  # some dataset is exhausted
             inputs = self.prepare_inputs(dataset_batch)
-            forward_outputs = self(inputs)
+            forward_outputs = self(inputs["input_embeds"])
             num_frames = inputs["input_lens"].sum()
             with loss_parallel():
                 text_loss = (
@@ -568,7 +567,8 @@ class DuplexS2SModel(LightningModule):
 
 class DuplexS2SModelSpeechDecoder(DuplexS2SModel):
     def __init__(self, cfg) -> None:
-        super().__init__(cfg)
+        super().__init__()
+        self.cfg = cfg
         self.speech_decoder = SpeechDecoder(
             speech_decoder_parms=dict(self.cfg.speech_decoder_parms),
             lantent_dim=self.llm.config.hidden_size,
@@ -578,7 +578,9 @@ class DuplexS2SModelSpeechDecoder(DuplexS2SModel):
 
     def forward(
         self,
-        input,
+        input_embeds: Tensor,
+        loss_mask=None,
+        input_audio_tokens=None
     ) -> dict[str, Tensor]:
         """
         Implements a fully offline forward pass through the entire model.
@@ -588,14 +590,13 @@ class DuplexS2SModelSpeechDecoder(DuplexS2SModel):
         |source speech + prev target text| -> |llm| -|
                                                      |-> |lm_head|    -> |token ids  |
         """
-        out = self.llm(inputs_embeds=input["input_embeds"])
-        B, T = input["input_embeds"].shape[:2]
-        speech_mask = input['loss_mask'][:, :, -1].reshape(input['loss_mask'].size(0), input['loss_mask'].size(1))
+        out = self.llm(inputs_embeds=input_embeds)
+        B, T = input_embeds.shape[:2]
+        speech_mask = loss_mask[:, :, -1].reshape(loss_mask.size(0), loss_mask.size(1))
         # import pdb; pdb.set_trace()
-        text_logits = self.lm_head(out['last_hidden_state'])
-        _, audio_logits = self.speech_decoder(out['last_hidden_state'].transpose(0,1), speech_mask, input_audio_tokens=input['input_audio_tokens'])
+        _, audio_logits = self.speech_decoder(out['last_hidden_state'].transpose(0,1), speech_mask, input_audio_tokens=input_audio_tokens)
         audio_logits = audio_logits.view(B, T, self._codebook_size, self._num_codebooks)
-
+        text_logits = self.lm_head(out['last_hidden_state'])
 
         return {
             "text_logits": text_logits,
@@ -615,7 +616,10 @@ class DuplexS2SModelSpeechDecoder(DuplexS2SModel):
         * Take care of any necessary slicing to align the shapes of source audio,
           target audio, and target token ids.
 
-
+        Additionally:
+        * We inline the speaker/system prompt injections from the original duplex function.
+        * We add cond_llm_backbone_on_speech_tokens if/else logic.
+        * We return loss_mask and input_audio_tokens as well.
         """
 
 
@@ -674,10 +678,13 @@ class DuplexS2SModelSpeechDecoder(DuplexS2SModel):
                 source_encoded = source_encoded[:, :-remainder]
 
 
+        if not getattr(self.cfg, "cond_llm_backbone_on_speech_tokens", True):
 
-        text_inputs = input_ids[:, :-1, -1]
-        input_embeds = self.embed_tokens(text_inputs)
-
+            text_inputs = input_ids[:, :-1, -1]
+            input_embeds = self.embed_tokens(text_inputs)
+        else:
+            #  [audio + text] as embedding
+            input_embeds = self.embed_tokens(input_ids[:, :-1])
 
         # embedding = source_encoded * duplex_user_channel_weight
 
@@ -706,7 +713,146 @@ class DuplexS2SModelSpeechDecoder(DuplexS2SModel):
             "input_audio_tokens": input_audio_tokens,
          }
 
+    def training_step(self, batch: dict, batch_idx: int):
+        import pdb;
+        pdb.set_trace()
+       # inputs = self.prepare_inputs(batch)
+        inputs = self.prepare_inputs_for_speech_decoder(batch)
 
+        forward_outputs = self(inputs["input_embeds"], inputs["loss_mask"], inputs["input_audio_tokens"])
+        num_frames = inputs["input_lens"].sum()
+        with loss_parallel():
+            text_loss = (
+                torch.nn.functional.cross_entropy(
+                    forward_outputs["text_logits"].transpose(1, 2),
+                    inputs["text_labels"],
+                    reduction="sum",
+                )
+                / num_frames
+            )
+            audio_loss = torch.nn.functional.cross_entropy(
+                forward_outputs["audio_logits"].transpose(1, 2),
+                inputs["audio_labels"],
+                reduction="sum",
+            ) / (num_frames * self._num_codebooks)
+
+        loss = text_loss + audio_loss
+
+        B, T = inputs["input_embeds"].shape[:2]
+        print(f"{loss=} {B=} {T=}")
+
+        self.log_dict(
+            {
+                "loss": loss,
+                "learning_rate": torch.as_tensor(self.trainer.optimizers[0].param_groups[0]['lr']),
+                "text_loss": text_loss,
+                "audio_loss": audio_loss,
+                "batch_size": B,
+                "sequence_length": T,
+                "num_frames": num_frames.to(torch.float32),  # avoid warning
+                "padding_ratio": num_frames / (B * T),
+            },
+            on_step=True,
+        )
+        return loss
+
+    def on_validation_epoch_start(self) -> None:
+        # Cleaning up GPU memory before we load ASRModel, because it may already
+        # be quite fragmented and close to the limit after observing many
+        # dynamic shapes during the training epoch.
+        torch.cuda.memory.empty_cache()
+        self.asr = ASRModel.from_pretrained(self.cfg.scoring_asr).to(torch.bfloat16).eval()
+        WithOptionalCudaGraphs.disable_cuda_graphs_recursive(self.asr, attribute_path="decoding.decoding")
+        # Setup a separate BLEU metric for each validation dataloader through CombinedLoader.
+        # See: https://lightning.ai/docs/pytorch/LTS/guides/data.html#accessing-dataloaders-within-lightningmodule
+        self._partial_val_losses = []
+        self.bleu = {}
+        for name in self.trainer.val_dataloaders.keys():
+            self.bleu[name] = SacreBLEUScore().to(self.device)
+
+    def on_validation_epoch_end(self) -> None:
+        for name, bleu in self.bleu.items():
+            self.log(f"val_asr_bleu_{name}", bleu.compute(), on_epoch=True, sync_dist=True)
+            bleu.reset()
+        self.asr = None  # free up GPU memory
+        val_loss = torch.mean(torch.stack(self._partial_val_losses))
+        self._partial_val_losses = None
+        self.log("val_loss", val_loss, on_epoch=True, sync_dist=False)
+        torch.cuda.memory.empty_cache()
+
+    def validation_step(self, batch: dict, batch_idx: int):
+        pass
+        for name, dataset_batch in batch.items():
+            if dataset_batch is None:
+                continue  # some dataset is exhausted
+            inputs = self.prepare_inputs_for_speech_decoder(dataset_batch)
+            forward_outputs = self(inputs["input_embeds"], inputs["loss_mask"], inputs["input_audio_tokens"])
+            num_frames = inputs["input_lens"].sum()
+            with loss_parallel():
+                text_loss = (
+                    torch.nn.functional.cross_entropy(
+                        forward_outputs["text_logits"].transpose(1, 2),
+                        inputs["text_labels"],
+                        reduction="sum",
+                    )
+                    / num_frames
+                )
+                audio_loss = torch.nn.functional.cross_entropy(
+                    forward_outputs["audio_logits"].transpose(1, 2),
+                    inputs["audio_labels"],
+                    reduction="sum",
+                ) / (num_frames * self._num_codebooks)
+
+            loss = text_loss + audio_loss
+            self._partial_val_losses.append(loss)
+
+            B = inputs["input_embeds"].shape[0]
+            self.log(f"val_loss_{name}", loss, on_epoch=True, sync_dist=True, batch_size=B)
+            self.log(f"val_text_loss_{name}", text_loss, on_epoch=True, sync_dist=True, batch_size=B)
+            self.log(f"val_audio_loss_{name}", audio_loss, on_epoch=True, sync_dist=True, batch_size=B)
+
+            # ASR BLEU
+            import torchaudio
+
+            with torch.inference_mode():
+                predicted_audio_tokens = torch.argmax(forward_outputs["audio_logits"], dim=2).transpose(1, 2)
+                with _safe_audio_codec_inference():
+                    predicted_audio, predicted_audio_lens = self._audio_codec.decode(
+                        tokens=predicted_audio_tokens, tokens_len=inputs["output_lens"]
+                    )
+                ans = self.asr.transcribe(
+                    list(torchaudio.functional.resample(predicted_audio, 22050, 16000)),
+                    batch_size=predicted_audio.shape[0],
+                    verbose=False,
+                )
+            self.bleu[name].update([hyp.text for hyp in ans], [[tt] for tt in dataset_batch["target_texts"]])
+
+    def on_test_epoch_start(self) -> None:
+        return self.on_validation_epoch_start()
+
+    def on_test_epoch_end(self) -> None:
+        return self.on_validation_epoch_end()
+
+    def test_step(self, *args: Any, **kwargs: Any):
+        return self.validation_step(*args, **kwargs)
+
+    def backward(self, *args, **kwargs):
+        with loss_parallel():
+            super().backward(*args, **kwargs)
+
+    def configure_optimizers(self):
+        parameters = chain(
+            self.perception.parameters(),
+            self.llm.parameters(),
+            self.lm_head.parameters(),
+            self.audio_head.parameters(),
+        )
+        optimizer = hydra.utils.instantiate(self.cfg.optimizer, parameters, _convert_='all')
+        lr_scheduler = hydra.utils.instantiate(self.cfg.lr_scheduler, optimizer)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": lr_scheduler, "interval": "step", "frequency": 1},
+        }
 
     @property
     def oomptimizer_schema(self) -> dict:

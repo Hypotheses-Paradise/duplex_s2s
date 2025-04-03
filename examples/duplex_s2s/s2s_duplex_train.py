@@ -18,7 +18,7 @@ import torch
 from lightning.pytorch import Callback, Trainer
 
 from nemo.collections.duplex_s2s.data.datamodule import S2SDataModule
-from nemo.collections.duplex_s2s.models.duplex_s2s_model import DuplexS2SModel
+from nemo.collections.duplex_s2s.models.duplex_s2s_model import DuplexS2SModel,DuplexS2SModelSpeechDecoder
 from nemo.core.config import hydra_runner
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
@@ -37,15 +37,19 @@ class PROFILING(Callback):
     def on_train_batch_start(
         self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", batch, batch_idx: int
     ) -> None:
-        if batch_idx == 0:
+        if batch_idx == 10:
             print("STARTING PROFILE")
+            #import nvtx
+            #self.profile = nvtx.Profile()
+            #self.profile.enable()
             torch.cuda.profiler.cudart().cudaProfilerStart()
 
     def on_train_batch_end(
         self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", outputs, batch, batch_idx: int
     ) -> None:
-        if batch_idx == 10:
+        if batch_idx == 15:
             print("STOPPING PROFILE")
+            #self.profile.disable()
             torch.cuda.profiler.cudart().cudaProfilerStop()
 
 
@@ -57,12 +61,13 @@ def train(cfg):
     # TODO: decide on exp_manager or adopting NeMo 2.0 API with _setup function, or sth else ?
     trainer = Trainer(
         **resolve_trainer_cfg(cfg.trainer),
-        # callbacks=[PROFILING()],
+        #callbacks=[PROFILING()],
     )
     exp_manager(trainer, cfg.get("exp_manager", None))
 
     with trainer.init_module():
-        model = DuplexS2SModel(cfg.model)
+    #    model = DuplexS2SModel(cfg.model)
+        model = DuplexS2SModelSpeechDecoder(cfg.model)
 
     # exp_manager / NeMo2 _setup provide:
     # * PEFT (possibly from HF)
